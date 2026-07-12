@@ -1,15 +1,22 @@
+const http = require('http');
 const WebSocket = require('ws');
-const PORT = process.env.PORT || 3000; 
-const wss = new WebSocket.Server({ port: PORT });
 
-// Aquí se guardarán todas las variables en la memoria del servidor
+const PORT = process.env.PORT || 3000; 
+
+// 1. Creamos un servidor web normal para los navegadores y Uptime Robot
+const server = http.createServer((req, res) => {
+    res.writeHead(200, { 'Content-Type': 'text/plain' });
+    res.end('Servidor Cloud32 V2 en linea. Conectate desde TurboWarp usando wss://');
+});
+
+// 2. Enganchamos el servidor WebSocket al servidor web
+const wss = new WebSocket.Server({ server });
+
 let cloudVars = {}; 
 
 console.log(`Cloud32 V2 (Fluido) iniciado en el puerto ${PORT}`);
 
 wss.on('connection', (ws) => {
-    // 1. Sincronización instantánea: Al conectarse, el servidor le manda 
-    // al jugador todo el estado actual de las variables de golpe.
     ws.send(JSON.stringify({ type: 'init', data: cloudVars }));
 
     ws.on('message', (message) => {
@@ -17,10 +24,8 @@ wss.on('connection', (ws) => {
             const parsed = JSON.parse(message);
             
             if (parsed.type === 'set') {
-                // Actualiza la memoria del servidor
                 cloudVars[parsed.name] = parsed.val;
                 
-                // Retransmite SOLO a los demás jugadores conectados (no al que lo envió)
                 const outMsg = JSON.stringify(parsed);
                 wss.clients.forEach((client) => {
                     if (client !== ws && client.readyState === WebSocket.OPEN) {
@@ -28,12 +33,11 @@ wss.on('connection', (ws) => {
                     }
                 });
             }
-        } catch (e) {
-            // Ignorar mensajes malformados para evitar crasheos por spam
-        }
+        } catch (e) {}
     });
+});
 
-    ws.on('close', () => {
-        // Lógica futura: Aquí podrías borrar las variables del jugador si se va
-    });
+// 3. Encendemos el servidor principal
+server.listen(PORT, () => {
+    console.log(`Escuchando en el puerto ${PORT}`);
 });
