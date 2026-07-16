@@ -1,101 +1,83 @@
-const http = require('http');
 const WebSocket = require('ws');
+const http = require('http');
 
-const PORT = process.env.PORT || 3000; 
+const PORT = process.env.PORT || 3000;
 
-// Servidor web básico para responder a los pings de Uptime Robot y navegadores
+// 1. Servidor HTTP con una ruta "/ping" para evitar que se duerma
 const server = http.createServer((req, res) => {
+  if (req.url === '/ping') {
     res.writeHead(200, { 'Content-Type': 'text/plain' });
-    res.end('Cloud32 Voice & Data Server activo.');
+    res.end('pong'); // Endpoint para servicios como UptimeRobot
+    return;
+  }
+  res.writeHead(200, { 'Content-Type': 'text/plain' });
+  res.end('Servidor Cloud32 activo en Render 🚀');
 });
 
 const wss = new WebSocket.Server({ server });
 
-// Estructura de memoria: rooms[nombre_sala] = { clients: Map(usuario -> ws), vars: {} }
-const rooms = {};
-
 wss.on('connection', (ws) => {
-    let currentRoom = null;
-    let myUser = null;
+  console.log('🔌 Nuevo cliente conectado.');
+  ws.isAlive = true;
+  ws.roomId = null;
 
-    ws.on('message', (message) => {
-        try {
-            const msg = JSON.parse(message);
+  ws.on('message', (message) => {
+    try {
+      const data = JSON.parse(message.toString());
 
-            // 1. Unirse a una sala
-            if (msg.type === 'join') {
-                currentRoom = msg.room;
-                myUser = msg.user;
+      if (data.method === 'handshake') {
+        ws.roomId = data.project_id || data.room || 'global';
+        console.log(`👤 Sala asignada: ${ws.roomId}`);
+        return;
+      }
 
-                if (!rooms[currentRoom]) {
-                    rooms[currentRoom] = { clients: new Map(), vars: {} };
-                }
-                rooms[currentRoom].clients.set(myUser, ws);
+      if (data.method === 'set') {
+        const targetRoom = ws.roomId || 'global';
 
-                // Enviar variables actuales de la sala al recién conectado
-                ws.send(JSON.stringify({ type: 'init_vars', data: rooms[currentRoom].vars }));
+        wss.clients.forEach((client) => {
+          if (
+            client !== ws && 
+            client.readyState === WebSocket.OPEN && 
+            client.roomId === targetRoom
+          ) {
+            client.send(JSON.stringify({
+              method: 'set',
+              name: data.name,
+              value: data.value
+            }));
+          }
+        });
+        return;
+      }
 
-                // Actualizar la lista de usuarios para todos en la sala
-                const userList = Array.from(rooms[currentRoom].clients.keys());
-                rooms[currentRoom].clients.forEach((clientWs) => {
-                    clientWs.send(JSON.stringify({ type: 'user_list', users: userList }));
-                });
+    } catch (error) {
+      console.error('❌ Error procesando mensaje:', error);
+    }
+  });
 
-                // Avisar a los demás que alguien entró (para que inicien la conexión de voz WebRTC)
-                rooms[currentRoom].clients.forEach((clientWs, user) => {
-                    if (user !== myUser) {
-                        clientWs.send(JSON.stringify({ type: 'peer_joined', user: myUser }));
-                    }
-                });
-            }
-            // 2. Puente de WebRTC (Llamadas de voz)
-            else if (msg.type === 'signal') {
-                if (rooms[currentRoom] && rooms[currentRoom].clients.has(msg.to)) {
-                    rooms[currentRoom].clients.get(msg.to).send(JSON.stringify({
-                        type: 'signal',
-                        from: myUser,
-                        signal: msg.signal
-                    }));
-                }
-            }
-            // 3. Sincronización de Variables (solo dentro de la sala)
-            else if (msg.type === 'set') {
-                if (rooms[currentRoom]) {
-                    rooms[currentRoom].vars[msg.name] = msg.val;
-                    
-                    const outMsg = JSON.stringify({ type: 'set', name: msg.name, val: msg.val });
-                    rooms[currentRoom].clients.forEach((clientWs, user) => {
-                        // Rebotar la variable a todos menos al que la envió
-                        if (user !== myUser) clientWs.send(outMsg);
-                    });
-                }
-            }
-        } catch (e) {
-            // Ignorar errores de parseo por spam
-        }
-    });
+  ws.on('pong', () => {
+    ws.isAlive = true;
+  });
 
-    ws.on('close', () => {
-        if (currentRoom && myUser && rooms[currentRoom]) {
-            // Eliminar al usuario de la sala
-            rooms[currentRoom].clients.delete(myUser);
-            
-            // Avisar a los demás quién quedó en la sala
-            const userList = Array.from(rooms[currentRoom].clients.keys());
-            rooms[currentRoom].clients.forEach((clientWs) => {
-                if (clientWs.readyState === WebSocket.OPEN) {
-                    clientWs.send(JSON.stringify({ type: 'user_list', users: userList }));
-                }
-            });
-
-            // Si la sala queda vacía, borrarla para ahorrar memoria en Render
-            if (rooms[currentRoom].clients.size === 0) {
-                delete rooms[currentRoom];
-            }
-        }
-    });
+  ws.on('close', () => console.log('❌ Cliente desconectado.'));
+  ws.on('error', (err) => console.error('⚠️ Error:', err.message));
 });
 
+// 2. EN RENDER EL TIMEOUT DE INACTIVIDAD ES DE ~100 SEGUNDOS.
+// Bajamos el latido a 25 segundos para que la conexión nunca parezca "inactiva".
+const interval = setInterval(() => {
+  wss.clients.forEach((ws) => {
+    if (ws.isAlive === false) {
+      console.log('💀 Limpiando conexión fantasma.');
+      return ws.terminate();
+    }
+    ws.isAlive = false;
+    ws.ping(); 
+  });
+}, 25000); // 25 segundos mantiene la conexión viva en el proxy de Render
+
+wss.on('close', () => clearInterval(interval));
+
 server.listen(PORT, () => {
-    console.log(`Cloud32 Voice Server escuchando en puerto ${PORT}`);
+  console.log(`🚀 Servidor Cloud32 escuchando en el puerto ${PORT}`);
 });
