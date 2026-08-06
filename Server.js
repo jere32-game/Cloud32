@@ -7,12 +7,6 @@ const crypto = require('crypto');
 const app = express();
 app.use(cors());
 
-//pp
-const server = http.createServer((req, res) => {
-    res.writeHead(200, { 'Content-Type': 'text/plain' });
-    res.end('Voice chat is ON :)');
-});
-
 // Usamos almacenamiento en memoria (MemoryStorage) para evitar crear carpetas locales
 const storage = multer.memoryStorage();
 const upload = multer({ storage: storage });
