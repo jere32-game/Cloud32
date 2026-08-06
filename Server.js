@@ -4,6 +4,11 @@ const WebSocket = require('ws');
 const multer = require('multer');
 const cors = require('cors');
 const crypto = require('crypto');
+//pp
+const server = http.createServer((req, res) => {
+    res.writeHead(200, { 'Content-Type': 'text/plain' });
+    res.end('Voice chat is ON :)');
+});
 
 const app = express();
 app.use(cors());
