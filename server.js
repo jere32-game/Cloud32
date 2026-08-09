@@ -5,23 +5,24 @@ const multer = require('multer');
 const cors = require('cors');
 const crypto = require('crypto');
 const app = express();
-
 app.use(cors());
 
-// ─── 1. PROTECCIÓN DE MEMORIA RAM ───
+// 1. LÍMITE DE TAMAÑO: Evita que un archivo gigante tire el servidor (5MB max)
 const storage = multer.memoryStorage();
 const upload = multer({ 
   storage: storage,
-  limits: { fileSize: 5 * 1024 * 1024 } // Máximo 5MB por archivo para no crashear Render
+  limits: { fileSize: 5 * 1024 * 1024 } // 5 Megabytes
 });
 
 const filesDb = new Map();
 
-// ─── 2. ENDPOINTS PARA CRON-JOB.ORG ───
+// ─── NUEVO: ENDPOINTS PARA CRON-JOB.ORG ───
+// Cron-job necesita recibir un "200 OK" para saber que el server está vivo
 app.get('/', (req, res) => res.status(200).send('Servidor Cloud32 Activo'));
 app.get('/ping', (req, res) => res.status(200).send('pong'));
 
-// ─── API HTTP PARA ARCHIVOS ───
+
+// ─── API HTTP ───
 app.post('/api/files/upload', upload.single('file'), (req, res) => {
   if (!req.file) return res.status(400).json({ error: 'No se subió ningún archivo' });
 
@@ -31,7 +32,7 @@ app.post('/api/files/upload', upload.single('file'), (req, res) => {
     buffer: req.file.buffer,
     mimetype: req.file.mimetype,
     originalname: req.file.originalname,
-    timestamp: Date.now() // Guardamos la hora
+    timestamp: Date.now() // Guardamos la hora en la que se subió
   });
 
   res.json({
@@ -48,7 +49,8 @@ app.get('/api/files/:id', (req, res) => {
   res.send(file.buffer);
 });
 
-// ─── 3. LIMPIEZA AUTOMÁTICA DE BASURA ───
+// ─── LIMPIEZA AUTOMÁTICA DE MEMORIA (RAM) ───
+// Borra archivos de la RAM que tengan más de 10 minutos para evitar que el servidor colapse
 setInterval(() => {
   const tenMinutesAgo = Date.now() - (10 * 60 * 1000);
   for (const [id, file] of filesDb.entries()) {
@@ -56,9 +58,10 @@ setInterval(() => {
       filesDb.delete(id);
     }
   }
-}, 60000); // Revisa y limpia cada 1 minuto
+}, 60000); // Revisa cada 1 minuto
 
-// ─── WEBSOCKETS (SISTEMA ANTI-DESCONEXIÓN) ───
+
+// ─── WEBSOCKETS ───
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
 
@@ -76,14 +79,13 @@ function broadcastUserList() {
 }
 
 wss.on('connection', (ws) => {
-  // Configuración del "Latido" (Heartbeat)
+  // 2. SISTEMA ANTI-CAÍDA WEBSOCKET (Heartbeat)
   ws.isAlive = true;
-  ws.on('pong', () => { ws.isAlive = true; });
+  ws.on('pong', () => { ws.isAlive = true; }); // Cuando recibe un pong del cliente, marca que sigue vivo
 
   const clientId = crypto.randomUUID();
   clients.set(ws, { id: clientId, username: 'Jugador_' + clientId.substring(0, 4), rooms: new Set() });
 
-  // Enviar variables al conectar
   for (const [name, val] of Object.entries(cloudVars)) {
     ws.send(JSON.stringify({ cmd: 'gvar', name, val }));
   }
@@ -106,7 +108,8 @@ wss.on('connection', (ws) => {
           break;
         case 'gmsg':
           const gmsgPayload = JSON.stringify({
-            cmd: 'gmsg', val: data.val,
+            cmd: 'gmsg',
+            val: data.val,
             origin: { id: sender.id, username: sender.username },
             rooms: Array.from(sender.rooms)
           });
@@ -130,7 +133,7 @@ wss.on('connection', (ws) => {
           break;
       }
     } catch (e) {
-      console.error('Mensaje corrupto ignorado');
+      console.error('Mensaje corrupto recibido:', e);
     }
   });
 
@@ -140,7 +143,8 @@ wss.on('connection', (ws) => {
   });
 });
 
-// Mantener vivas las conexiones (Ping cada 30 seg)
+// 3. INTERVALO PING WEBSOCKET
+// Cada 30 segundos, verifica si los clientes siguen ahí para que el proxy de Render no corte la conexión
 const interval = setInterval(() => {
   wss.clients.forEach((ws) => {
     if (ws.isAlive === false) return ws.terminate();
