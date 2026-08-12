@@ -5,34 +5,32 @@ const multer = require('multer');
 const cors = require('cors');
 const crypto = require('crypto');
 const app = express();
+
 app.use(cors());
 
-// 1. LÍMITE DE TAMAÑO: Evita que un archivo gigante tire el servidor (5MB max)
+// Protección de memoria RAM para evitar apagones
 const storage = multer.memoryStorage();
 const upload = multer({ 
   storage: storage,
-  limits: { fileSize: 5 * 1024 * 1024 } // 5 Megabytes
+  limits: { fileSize: 5 * 1024 * 1024 }
 });
 
 const filesDb = new Map();
 
-// ─── NUEVO: ENDPOINTS PARA CRON-JOB.ORG ───
-// Cron-job necesita recibir un "200 OK" para saber que el server está vivo
+// Endpoints para cron-job.org
 app.get('/', (req, res) => res.status(200).send('Servidor Cloud32 Activo'));
 app.get('/ping', (req, res) => res.status(200).send('pong'));
 
-
-// ─── API HTTP ───
+// API HTTP
 app.post('/api/files/upload', upload.single('file'), (req, res) => {
   if (!req.file) return res.status(400).json({ error: 'No se subió ningún archivo' });
 
   const fileId = crypto.randomBytes(8).toString('hex');
-  
   filesDb.set(fileId, {
     buffer: req.file.buffer,
     mimetype: req.file.mimetype,
     originalname: req.file.originalname,
-    timestamp: Date.now() // Guardamos la hora en la que se subió
+    timestamp: Date.now()
   });
 
   res.json({
@@ -49,8 +47,7 @@ app.get('/api/files/:id', (req, res) => {
   res.send(file.buffer);
 });
 
-// ─── LIMPIEZA AUTOMÁTICA DE MEMORIA (RAM) ───
-// Borra archivos de la RAM que tengan más de 10 minutos para evitar que el servidor colapse
+// Limpieza automática
 setInterval(() => {
   const tenMinutesAgo = Date.now() - (10 * 60 * 1000);
   for (const [id, file] of filesDb.entries()) {
@@ -58,15 +55,24 @@ setInterval(() => {
       filesDb.delete(id);
     }
   }
-}, 60000); // Revisa cada 1 minuto
+}, 60000);
 
-
-// ─── WEBSOCKETS ───
+// ─── WEBSOCKETS (CON CONTEXTO DE CANAL/SALA) ───
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
 
-const cloudVars = {};
+// Variables aisladas por sala
+const roomVars = { 'global': {} };
 const clients = new Map();
+
+// Funciones de validación de salas
+function getUserRooms(user) {
+  return user.rooms.size > 0 ? Array.from(user.rooms) : ['global'];
+}
+
+function shareAnyRoom(roomsA, roomsB) {
+  return roomsA.some(r => roomsB.includes(r));
+}
 
 function broadcastUserList() {
   const users = Array.from(clients.values()).map(c => c.username).filter(Boolean);
@@ -79,15 +85,17 @@ function broadcastUserList() {
 }
 
 wss.on('connection', (ws) => {
-  // 2. SISTEMA ANTI-CAÍDA WEBSOCKET (Heartbeat)
   ws.isAlive = true;
-  ws.on('pong', () => { ws.isAlive = true; }); // Cuando recibe un pong del cliente, marca que sigue vivo
+  ws.on('pong', () => { ws.isAlive = true; }); 
 
   const clientId = crypto.randomUUID();
   clients.set(ws, { id: clientId, username: 'Jugador_' + clientId.substring(0, 4), rooms: new Set() });
 
-  for (const [name, val] of Object.entries(cloudVars)) {
-    ws.send(JSON.stringify({ cmd: 'gvar', name, val }));
+  // Transmitir variables base si no tiene sala asignada
+  if (roomVars['global']) {
+    for (const [name, val] of Object.entries(roomVars['global'])) {
+      ws.send(JSON.stringify({ cmd: 'gvar', name, val }));
+    }
   }
 
   ws.on('message', (message) => {
@@ -100,40 +108,77 @@ wss.on('connection', (ws) => {
           sender.username = data.val;
           broadcastUserList();
           break;
-        case 'link':
-          if (Array.isArray(data.val)) data.val.forEach(r => sender.rooms.add(r));
+
+        case 'link': // Entrar a sala
+          if (Array.isArray(data.val)) {
+            data.val.forEach(roomName => {
+              sender.rooms.add(roomName);
+              // Al entrar, enviar el estado actual exacto de esa sala
+              if (roomVars[roomName]) {
+                for (const [name, val] of Object.entries(roomVars[roomName])) {
+                  ws.send(JSON.stringify({ cmd: 'gvar', name, val }));
+                }
+              }
+            });
+          }
           break;
-        case 'unlink':
-          if (Array.isArray(data.val)) data.val.forEach(r => sender.rooms.delete(r));
+
+        case 'unlink': // Salir de sala
+          if (Array.isArray(data.val)) {
+            data.val.forEach(r => sender.rooms.delete(r));
+          }
           break;
-        case 'gmsg':
+
+        case 'gmsg': // Mensaje con contexto de sala respetado
+          const senderRooms = getUserRooms(sender);
           const gmsgPayload = JSON.stringify({
             cmd: 'gmsg',
             val: data.val,
             origin: { id: sender.id, username: sender.username },
-            rooms: Array.from(sender.rooms)
+            rooms: senderRooms
           });
-          for (const [client] of clients) {
-            if (client !== ws && client.readyState === WebSocket.OPEN) client.send(gmsgPayload);
+          
+          for (const [client, info] of clients) {
+            if (client !== ws && client.readyState === WebSocket.OPEN) {
+              const targetRooms = getUserRooms(info);
+              if (shareAnyRoom(senderRooms, targetRooms)) {
+                client.send(gmsgPayload);
+              }
+            }
           }
           break;
-        case 'pmsg':
+
+        case 'pmsg': // Mensaje directo
           const targetId = data.id; 
           const pmsgPayload = JSON.stringify({ cmd: 'pmsg', val: data.val, origin: { id: sender.id, username: sender.username } });
           for (const [client, info] of clients) {
-            if ((info.username === targetId || info.id === targetId) && client.readyState === WebSocket.OPEN) client.send(pmsgPayload);
+            if ((info.username === targetId || info.id === targetId) && client.readyState === WebSocket.OPEN) {
+              client.send(pmsgPayload);
+            }
           }
           break;
-        case 'gvar':
-          cloudVars[data.name] = data.val;
+
+        case 'gvar': // Variables guardadas e irradiadas estrictamente en su sala
+          const activeRooms = getUserRooms(sender);
           const gvarPayload = JSON.stringify({ cmd: 'gvar', name: data.name, val: data.val });
-          for (const [client] of clients) {
-            if (client !== ws && client.readyState === WebSocket.OPEN) client.send(gvarPayload);
+          
+          activeRooms.forEach(room => {
+            if (!roomVars[room]) roomVars[room] = {};
+            roomVars[room][data.name] = data.val;
+          });
+          
+          for (const [client, info] of clients) {
+            if (client !== ws && client.readyState === WebSocket.OPEN) {
+              const targetRooms = getUserRooms(info);
+              if (shareAnyRoom(activeRooms, targetRooms)) {
+                client.send(gvarPayload);
+              }
+            }
           }
           break;
       }
     } catch (e) {
-      console.error('Mensaje corrupto recibido:', e);
+      console.error('Mensaje corrupto ignorado');
     }
   });
 
@@ -143,8 +188,7 @@ wss.on('connection', (ws) => {
   });
 });
 
-// 3. INTERVALO PING WEBSOCKET
-// Cada 30 segundos, verifica si los clientes siguen ahí para que el proxy de Render no corte la conexión
+// Mantener vivas las conexiones
 const interval = setInterval(() => {
   wss.clients.forEach((ws) => {
     if (ws.isAlive === false) return ws.terminate();
@@ -153,11 +197,7 @@ const interval = setInterval(() => {
   });
 }, 30000);
 
-wss.on('close', () => {
-  clearInterval(interval);
-});
+wss.on('close', () => clearInterval(interval));
 
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => {
-  console.log(`Servidor Cloud32 en línea por el puerto ${PORT}`);
-});
+server.listen(PORT, () => console.log(`Servidor Cloud32 en línea por el puerto ${PORT}`));
