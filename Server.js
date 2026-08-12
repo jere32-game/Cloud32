@@ -104,7 +104,7 @@ wss.on('connection', (ws) => {
           if (Array.isArray(data.val)) data.val.forEach(r => sender.rooms.delete(r));
           break;
 
-        case 'gmsg': // Mensajes de chat
+        case 'gmsg': // Mensajes de chat xd
           const senderRooms = Array.from(sender.rooms);
           const gmsgPayload = JSON.stringify({
             cmd: 'gmsg', val: data.val,
