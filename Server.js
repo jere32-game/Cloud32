@@ -218,8 +218,6 @@ wss.on('connection', (ws) => {
 
           const gvarPayload = JSON.stringify({ cmd: 'gvar', name: data.name, val: data.val });
           for (const [client] of clients) {
-            // 🔥 AQUÍ ESTÁ LA MAGIA: Eliminé el "client !== ws". 
-            // Ahora se lo envía a TODO EL MUNDO, incluyendo a quien mandó el mensaje originalmente.
             if (client.readyState === WebSocket.OPEN) {
               client.send(gvarPayload);
             }
