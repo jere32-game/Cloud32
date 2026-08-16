@@ -18,7 +18,6 @@ const filesDb = new Map();
 
 // ─── PROTECCIÓN ANTI-CURIOSOS ───
 app.get('/', (req, res) => res.status(200).send('LOL No es tan facil amigo'));
-
 app.get('/ping', (req, res) => res.status(200).send('pong'));
 
 // ─── API HTTP ───
@@ -49,13 +48,14 @@ setInterval(() => {
 }, 60000);
 
 
-// ─── WEBSOCKETS (CON BASE DE DATOS DE 2 HORAS EN RAM) ───
+// ─── WEBSOCKETS (SISTEMA DE SALAS Y RAM 2 HORAS) ───
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
 
 const cloudVars = new Map(); 
 const clients = new Map();
 
+// Limpiador de RAM de 2 Horas
 setInterval(() => {
   const twoHoursAgo = Date.now() - (2 * 60 * 60 * 1000); 
   for (const [name, data] of cloudVars.entries()) {
@@ -65,11 +65,28 @@ setInterval(() => {
   }
 }, 60000); 
 
-function broadcastUserList() {
-  const users = Array.from(clients.values()).map(c => c.username).filter(Boolean);
-  const msg = JSON.stringify({ cmd: 'ulist', val: users });
-  for (const [client] of clients) {
-    if (client.readyState === WebSocket.OPEN) client.send(msg);
+// 🔥 MOTOR DE SALAS (ROOMS)
+const getRooms = (client) => client.rooms.size > 0 ? Array.from(client.rooms) : ['global'];
+
+function shareRoom(clientA, clientB) {
+  const roomsA = getRooms(clientA);
+  const roomsB = getRooms(clientB);
+  // Si comparten al menos una sala, se pueden ver y comunicar
+  return roomsA.some(r => roomsB.includes(r));
+}
+
+// 🔥 RADAR DE JUGADORES (Aislado por salas)
+function refreshAllUlists() {
+  for (const [ws, client] of clients) {
+    if (ws.readyState !== WebSocket.OPEN) continue;
+    
+    const visibleUsers = new Set();
+    for (const [otherWs, otherClient] of clients) {
+      if (otherClient.username && shareRoom(client, otherClient)) {
+        visibleUsers.add(otherClient.username);
+      }
+    }
+    ws.send(JSON.stringify({ cmd: 'ulist', val: Array.from(visibleUsers) }));
   }
 }
 
@@ -78,10 +95,15 @@ wss.on('connection', (ws) => {
   ws.on('pong', () => { ws.isAlive = true; });
 
   const clientId = crypto.randomUUID();
-  clients.set(ws, { id: clientId, username: 'Jugador_' + clientId.substring(0, 4), rooms: new Set() });
+  // Se conectan sin nombre hasta que envíen 'setid'
+  clients.set(ws, { id: clientId, username: '', rooms: new Set() });
 
-  for (const [name, data] of cloudVars.entries()) {
-    ws.send(JSON.stringify({ cmd: 'gvar', name: name, val: data.val }));
+  // Enviar las variables del lobby global al entrar
+  for (const [key, varData] of cloudVars.entries()) {
+    if (key.startsWith("global||")) {
+      const varName = key.split("||")[1];
+      ws.send(JSON.stringify({ cmd: 'gvar', name: varName, val: varData.val }));
+    }
   }
 
   ws.on('message', (message) => {
@@ -92,44 +114,57 @@ wss.on('connection', (ws) => {
       switch (data.cmd) {
         case 'setid':
           sender.username = data.val;
-          broadcastUserList();
+          refreshAllUlists();
           break;
 
         case 'link':
-          if (Array.isArray(data.val)) data.val.forEach(r => sender.rooms.add(r));
-          break;
-
-        case 'unlink':
-          if (Array.isArray(data.val)) data.val.forEach(r => sender.rooms.delete(r));
-          break;
-
-        case 'gmsg':
-          const senderRooms = Array.from(sender.rooms);
-          const gmsgPayload = JSON.stringify({
-            cmd: 'gmsg', val: data.val,
-            origin: { id: sender.id, username: sender.username },
-            rooms: senderRooms
-          });
-          for (const [client] of clients) {
-            if (client !== ws && client.readyState === WebSocket.OPEN) client.send(gmsgPayload);
+          if (Array.isArray(data.val)) {
+            data.val.forEach(r => {
+              sender.rooms.add(r);
+              // Al entrar a una sala, le enviamos las variables vivas de ESA sala
+              for (const [key, varData] of cloudVars.entries()) {
+                if (key.startsWith(r + "||")) {
+                  const varName = key.split("||")[1];
+                  ws.send(JSON.stringify({ cmd: 'gvar', name: varName, val: varData.val }));
+                }
+              }
+            });
+            refreshAllUlists(); // Actualiza quién ve a quién
           }
           break;
 
+        case 'unlink':
+          if (Array.isArray(data.val)) {
+            data.val.forEach(r => sender.rooms.delete(r));
+            refreshAllUlists();
+          }
+          break;
+
+        case 'gmsg':
         case 'pmsg':
-          const targetId = data.id; 
-          const pmsgPayload = JSON.stringify({ cmd: 'pmsg', val: data.val, origin: { id: sender.id, username: sender.username } });
-          for (const [client, info] of clients) {
-            if ((info.username === targetId || info.id === targetId) && client.readyState === WebSocket.OPEN) client.send(pmsgPayload);
+          // El chat y mensajes privados se mantienen iguales pero ya protegidos por shareRoom
+          const payload = JSON.stringify({ cmd: data.cmd, val: data.val, origin: { id: sender.id, username: sender.username } });
+          for (const [clientWs, clientInfo] of clients) {
+            if (clientWs.readyState === WebSocket.OPEN && shareRoom(sender, clientInfo)) {
+              if (data.cmd === 'pmsg' && clientInfo.username !== data.id) continue;
+              clientWs.send(payload);
+            }
           }
           break;
 
         case 'gvar':
-          cloudVars.set(data.name, { val: data.val, timestamp: Date.now() });
+          const senderRooms = getRooms(sender);
+          
+          // Guardar en la RAM con la etiqueta de la sala (Ej: "sala1||Puntos")
+          senderRooms.forEach(room => {
+            cloudVars.set(room + "||" + data.name, { val: data.val, timestamp: Date.now() });
+          });
 
+          // Transmitir SOLO a los que comparten sala con el enviador
           const gvarPayload = JSON.stringify({ cmd: 'gvar', name: data.name, val: data.val });
-          for (const [client] of clients) {
-            if (client.readyState === WebSocket.OPEN) {
-              client.send(gvarPayload);
+          for (const [clientWs, clientInfo] of clients) {
+            if (clientWs.readyState === WebSocket.OPEN && shareRoom(sender, clientInfo)) {
+              clientWs.send(gvarPayload);
             }
           }
           break;
@@ -141,7 +176,7 @@ wss.on('connection', (ws) => {
 
   ws.on('close', () => {
     clients.delete(ws);
-    broadcastUserList();
+    refreshAllUlists();
   });
 });
 
